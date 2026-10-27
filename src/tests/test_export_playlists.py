@@ -1,14 +1,15 @@
-"""Run from the repository root: python -m unittest discover -s src -v."""
+"""Run from the repository root: python -m unittest discover -s src\\tests -v."""
 
 import csv
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from export_playlists import (
+from src.export_playlists import (
     LIBRARY_READY, advertised_count, amazon_url, collect_scrolling,
     discover_playlists, playlist_url, row_key,
-    song_id, track_record, write_csv,
+    refresh_playlist, song_id, track_record, write_csv,
 )
 
 
@@ -75,6 +76,71 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(rows[0]["album_name"], "")
             self.assertEqual(rows[1]["playlist_name"], "'@profile")
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+    def test_refresh_keeps_youtube_links_across_partial_and_complete_exports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            partial = Path(directory) / "songs.partial.csv"
+            complete = Path(directory) / "songs.csv"
+            row = {"song_id": "S", "song_title": "Title", "artist_name": "Artist"}
+            url = "https://www.youtube.com/watch?v=JXgV1rXUoME"
+            write_csv(partial, [dict(row, youtube_url=url)])
+            write_csv(partial, [row, dict(row, playlist_name="Other")])
+            with partial.open(encoding="utf-8-sig", newline="") as file:
+                self.assertEqual([r["youtube_url"] for r in csv.DictReader(file)], [url, url])
+            write_csv(complete, [row, dict(row, song_id="Different")])
+            with complete.open(encoding="utf-8-sig", newline="") as file:
+                self.assertEqual([r["youtube_url"] for r in csv.DictReader(file)], [url, ""])
+
+    @patch("src.export_playlists.extract_playlist")
+    @patch("playwright.sync_api.sync_playwright")
+    def test_refresh_adds_new_occurrences_without_deleting_old_rows(self, playwright, extract):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "songs.partial.csv"
+            url = "https://music.amazon.in/user-playlists/one"
+            other = "https://music.amazon.in/user-playlists/two"
+            cached = "https://www.youtube.com/watch?v=JXgV1rXUoME"
+            old = {
+                "song_id": "S", "song_title": "Title", "artist_name": "Artist",
+                "playlist_url": url, "playlist_position": "1", "youtube_url": cached,
+            }
+            write_csv(path, [old])
+            fresh = [
+                dict(old, youtube_url=""),
+                dict(old, song_id="New", song_title="New", playlist_position="2", youtube_url=""),
+                dict(old, playlist_position="3", youtube_url=""),
+            ]
+            extract.return_value = (fresh, False)
+            first = refresh_playlist(url + "?ref=share", path)
+            self.assertEqual(first["added"], 2)
+            extract.reset_mock()
+            second = refresh_playlist([url, url], path)
+            self.assertEqual(second["added"], 0)
+            extract.assert_called_once()
+            with path.open(encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(len(rows), 3)
+            self.assertEqual([r["youtube_url"] for r in rows if r["song_id"] == "S"], [cached, cached])
+            extract.return_value = ([dict(old, playlist_url=other, youtube_url="")], True)
+            self.assertEqual(refresh_playlist([other], path)["added"], 1)
+            with path.open(encoding="utf-8-sig", newline="") as file:
+                self.assertEqual(len(list(csv.DictReader(file))), 4)
+
+    @patch("src.export_playlists.extract_playlist")
+    @patch("playwright.sync_api.sync_playwright")
+    def test_failed_refresh_leaves_csv_unchanged(self, playwright, extract):
+        from playwright.sync_api import Error
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "songs.csv"
+            write_csv(path, [{"song_id": "S", "playlist_url": "https://music.amazon.in/playlists/P"}])
+            before = path.read_bytes()
+            extract.side_effect = Error("Playlist unavailable")
+            report = refresh_playlist("https://music.amazon.in/playlists/P", path)
+            self.assertEqual(report["added"], 0)
+            self.assertEqual(len(report["errors"]), 1)
+            self.assertEqual(path.read_bytes(), before)
+            with self.assertRaisesRegex(ValueError, "direct playlist"):
+                refresh_playlist("https://music.amazon.in/profiles/me", path)
 
     def test_scrolling_accumulates_virtual_rows_and_reports_cap(self):
         class Page:

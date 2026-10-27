@@ -17,6 +17,7 @@ Only metadata is exported, not audio or complete listening history.
 """
 
 import argparse
+from collections import Counter
 import csv
 import os
 from pathlib import Path
@@ -29,6 +30,7 @@ from urllib.parse import parse_qs, quote, urljoin, urlsplit, urlunsplit
 FIELDS = [
     "song_id", "song_title", "artist_name", "album_name", "playlist_name",
     "playlist_position", "duration", "song_url", "playlist_url", "source_profile",
+    "youtube_url",
 ]
 PLAYLIST_PATH = re.compile(r"^/(?:playlists|user-playlists)/[^/]+/?$")
 EMPTY_PROFILE = "There is no available public content on this profile."
@@ -118,6 +120,32 @@ def spreadsheet_safe(value):
 def write_csv(path, rows):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    sibling = (
+        path.with_name(path.stem.removesuffix(".partial") + path.suffix)
+        if path.stem.endswith(".partial")
+        else path.with_name(path.stem + ".partial" + path.suffix)
+    )
+    cached = {}
+
+    def key(row):
+        song_id = row.get("song_id", "").strip().casefold()
+        if song_id:
+            return ("id", song_id)
+        return (
+            "title", " ".join(row.get("song_title", "").casefold().split()),
+            " ".join(row.get("artist_name", "").casefold().split()),
+        )
+
+    for existing in (sibling, path):
+        if existing.is_file():
+            with existing.open(encoding="utf-8-sig", newline="") as file:
+                for row in csv.DictReader(file):
+                    if row.get("youtube_url"):
+                        cached[key(row)] = row["youtube_url"]
+    rows = [
+        dict(row, youtube_url=row.get("youtube_url") or cached.get(key(row), ""))
+        for row in rows
+    ]
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -230,6 +258,70 @@ def extract_playlist(page, url, fallback_name, source, max_scrolls):
     print(f"  {name}: {len(rows)} tracks; displayed total: {expected}; "
           f"{'count matched' if complete else 'INCOMPLETE / unverified'}")
     return rows, complete
+
+
+def refresh_playlist(playlists, csv_path=None, headless=True, max_scrolls=300):
+    """Append newly visible playlist occurrences without deleting existing rows."""
+    from playwright.sync_api import Error as BrowserError, sync_playwright
+
+    if isinstance(playlists, str):
+        playlists = [playlists]
+    urls = list(dict.fromkeys(amazon_url(value) for value in playlists))
+    if not urls or any(not PLAYLIST_PATH.fullmatch(urlsplit(url).path) for url in urls):
+        raise ValueError("Provide one or more direct playlist URLs.")
+    if max_scrolls < 1:
+        raise ValueError("max_scrolls must be positive.")
+    path = Path(csv_path) if csv_path is not None else Path(__file__).resolve().parent.parent / "all_songs.partial.csv"
+    rows = []
+    if path.exists():
+        with path.open(encoding="utf-8-sig", newline="") as file:
+            reader = csv.DictReader(file)
+            if "playlist_url" not in (reader.fieldnames or []):
+                raise ValueError("Existing song CSV needs a playlist_url column.")
+            rows = list(reader)
+
+    def occurrence_key(row):
+        location = urlsplit(row.get("playlist_url", ""))
+        url = urlunsplit((location.scheme, location.netloc, location.path.rstrip("/"), "", ""))
+        identity = row.get("song_id", "").strip().casefold()
+        if not identity:
+            identity = tuple(
+                " ".join(row.get(field, "").casefold().split())
+                for field in ("song_title", "artist_name", "album_name")
+            )
+        return url, identity
+
+    counts = Counter(occurrence_key(row) for row in rows)
+    report = {"added": 0, "playlists": [], "errors": {}, "csv_path": str(path.resolve())}
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=headless, chromium_sandbox=True)
+        try:
+            page = browser.new_page(viewport={"width": 1440, "height": 1000}, locale="en-IN")
+            for url in urls:
+                try:
+                    fresh, complete = extract_playlist(page, url, "", url, max_scrolls)
+                except BrowserError as error:
+                    report["errors"][url] = str(error)
+                    continue
+                seen = Counter()
+                added = 0
+                for row in fresh:
+                    key = occurrence_key(row)
+                    seen[key] += 1
+                    if seen[key] > counts[key]:
+                        rows.append(row)
+                        counts[key] += 1
+                        added += 1
+                report["added"] += added
+                report["playlists"].append({
+                    "playlist_url": url, "visible_tracks": len(fresh),
+                    "added": added, "count_verified": complete,
+                })
+        finally:
+            browser.close()
+    if report["added"]:
+        write_csv(path, rows)
+    return report
 
 
 def main(argv=None):

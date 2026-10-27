@@ -1,1 +1,4 @@
 playwright>=1.55,<2
+yt-dlp[default]>=2026.8.19
+imageio-ffmpeg>=0.6,<1
+mutagen>=1.47,<2
