@@ -1,3 +1,5 @@
+"""Run from the repository root: python -m unittest discover -s src -v."""
+
 import csv
 from pathlib import Path
 import tempfile

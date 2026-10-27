@@ -1,13 +1,13 @@
-"""Export visible Amazon Music playlists; no developer API credentials required.
+r"""Export visible Amazon Music playlists; no developer API credentials required.
 
 Setup:
     python -m pip install -r requirements.txt
     python -m playwright install chromium
 
-Examples (run from this directory):
-    python export_playlists.py @arkabhowmik @abhowmik95
-    python export_playlists.py --library
-    python export_playlists.py --login @arkabhowmik
+Examples (run from the repository root):
+    python .\src\export_playlists.py @arkabhowmik @abhowmik95
+    python .\src\export_playlists.py --library
+    python .\src\export_playlists.py --login @arkabhowmik
 
 --library opens a browser: sign in on Amazon, open Library > Playlists, then
 press Enter in the terminal. Run separately for each Amazon account.
@@ -238,7 +238,7 @@ def main(argv=None):
     parser.add_argument("--region", choices=("in", "com"), default="in")
     parser.add_argument(
         "--output", type=Path,
-        default=Path(__file__).with_name("amazon_music.csv"),
+        default=Path(__file__).resolve().parent.parent / "amazon_music.csv",
     )
     parser.add_argument("--login", action="store_true", help="Pause for manual sign-in on Amazon")
     parser.add_argument("--library", action="store_true", help="Sign in and discover playlists from your library")
