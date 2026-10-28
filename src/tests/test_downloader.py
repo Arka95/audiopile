@@ -192,7 +192,7 @@ class DownloaderTests(unittest.TestCase):
         peak = 0
         find.side_effect = lambda song: f"https://www.youtube.com/watch?v={int(song.title):011d}"
 
-        def fake_download(url, directory, song, on_bytes):
+        def fake_download(url, directory, song, on_bytes, _cache=None):
             nonlocal active, peak
             with lock:
                 active += 1
@@ -224,13 +224,19 @@ class DownloaderTests(unittest.TestCase):
             self.assertEqual(progress["completed"], 12)
             self.assertEqual(progress["succeeded"], 12)
             self.assertEqual(progress["failed"], 0)
+            waves = [
+                json.loads(line)
+                for line in (Path(directory) / "worker_batches.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual([wave["songs"] for wave in waves], [10, 2])
+            self.assertEqual(progress["current_batch"], 2)
         with self.assertRaisesRegex(ValueError, "1 to 10"):
             download_songs("song", max_workers=11)
 
     @patch("src.downloader.core.download_audio")
     @patch("src.downloader.core.find_video", return_value="https://www.youtube.com/watch?v=JXgV1rXUoME")
     def test_failure_isolation_and_metadata_specific_outputs(self, find, download):
-        def fake_download(url, directory, song, on_bytes):
+        def fake_download(url, directory, song, on_bytes, _cache=None):
             if song.title == "bad":
                 raise RuntimeError("unavailable")
             on_bytes(500)
@@ -276,6 +282,94 @@ class DownloaderTests(unittest.TestCase):
             self.assertIn(title, buffer.getvalue().decode("utf-8"))
         finally:
             stream.close()
+
+    @patch("src.downloader.core.download_audio")
+    @patch("src.downloader.core.find_video")
+    def test_existing_song_id_skips_network_even_after_filename_and_metadata_changes(self, find, download):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "renamed.mp3"
+            path.write_bytes(b"fixture")
+            url = "https://www.youtube.com/watch?v=JXgV1rXUoME"
+            tag_audio(path, Song(title="Old", artist="Artist", album="Old album", song_id="S", youtube_url=url))
+            song = Song(title="Updated", artist="Artist", album="New album", song_id="S")
+            batch = download_songs([song, song], output_dir=directory)
+            self.assertEqual(len(batch.results), 1)
+            self.assertTrue(batch.results[0].cached)
+            self.assertEqual(batch.results[0].path, path.resolve())
+            self.assertEqual(batch.bytes_downloaded, 0)
+            self.assertEqual(ID3(path)["TXXX:song_id"].text, ["S"])
+            self.assertEqual(ID3(path)["TALB"].text, ["New album"])
+            find.assert_not_called()
+            download.assert_not_called()
+
+    @patch("src.downloader.core.YoutubeDL")
+    def test_direct_download_reuses_embedded_id_without_touching_existing_file(self, factory):
+        from src.downloader.cache import AudioCache
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "arbitrary.mp3"
+            path.write_bytes(b"fixture")
+            song = Song(title="Title", artist="Artist", album="Album", song_id="S",
+                        youtube_url="https://www.youtube.com/watch?v=JXgV1rXUoME")
+            tag_audio(path, song)
+            before = path.read_bytes()
+            self.assertEqual(download_audio(song.youtube_url, directory, song), path.resolve())
+            self.assertEqual(path.read_bytes(), before)
+            factory.assert_not_called()
+            self.assertIsNone(AudioCache(directory).find(
+                Song(title="Title", artist="Artist", song_id="Different")
+            ))
+
+    @patch("src.downloader.core.download_audio")
+    @patch("src.downloader.core.find_video", return_value="https://www.youtube.com/watch?v=JXgV1rXUoME")
+    def test_next_worker_batch_waits_for_all_current_workers(self, find, download):
+        next_started = Event()
+        slow_finished = Event()
+
+        def fake_download(url, directory, song, on_bytes, _cache=None):
+            if song.title == "slow":
+                next_started.wait(0.2)
+                slow_finished.set()
+            elif song.title in {"third", "fourth"}:
+                if not slow_finished.is_set():
+                    raise RuntimeError("Next batch overlapped the previous batch")
+                next_started.set()
+            return Path(directory) / f"{song.title}.mp3"
+
+        download.side_effect = fake_download
+        with tempfile.TemporaryDirectory() as directory:
+            batch = download_songs(
+                ["slow", "fast", "third", "fourth"], max_workers=2, output_dir=directory,
+            )
+            self.assertTrue(all(result.error is None for result in batch.results))
+            self.assertEqual(download.call_count, 4)
+
+    def test_missing_csv_metadata_is_not_guessed_from_youtube(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "song.mp3"
+            path.write_bytes(b"fixture")
+            tag_audio(path, Song(title="Title", artist="Old artist", album="Old album", song_id="S"))
+            tag_audio(path, Song(title="Title", song_id="S"),
+                      {"artist": "YouTube guess", "album": "YouTube guess"})
+            tags = ID3(path)
+            self.assertNotIn("TPE1", tags)
+            self.assertNotIn("TALB", tags)
+            self.assertEqual(tags["TXXX:song_id"].text, ["S"])
+
+    @patch("src.downloader.core.download_audio")
+    @patch("src.downloader.core.find_video", side_effect=RuntimeError("unavailable"))
+    def test_missing_link_failure_does_not_redownload_existing_audio(self, find, download):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "renamed.mp3"
+            path.write_bytes(b"fixture")
+            tag_audio(path, Song(title="Old title", song_id="S"))
+            batch = download_songs(Song(title="Current title", song_id="S"), output_dir=directory)
+            result = batch.results[0]
+            self.assertTrue(result.cached)
+            self.assertEqual(result.path, path.resolve())
+            self.assertIn("YouTube link lookup failed", result.error)
+            self.assertEqual(ID3(path)["TIT2"].text, ["Current title"])
+            download.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -37,7 +37,8 @@ def main(argv=None):
             failures += 1
             print(f"FAILED {label}: {result.error}")
         else:
-            print(f"SAVED {label}: {result.path} (YouTube: {result.youtube_url})")
+            status = "CACHED" if result.cached else "SAVED"
+            print(f"{status} {label}: {result.path} (YouTube: {result.youtube_url})")
     print(f"{len(batch.results) - failures} succeeded; {failures} failed.")
     print(
         f"Batch: {batch.elapsed_seconds:.2f}s; "

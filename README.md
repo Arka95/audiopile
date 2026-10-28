@@ -4,6 +4,18 @@ Export Amazon Music playlist metadata to searchable CSVs using a local
 Playwright browser, and download explicitly requested, authorized YouTube audio.
 Playlist exports do not include complete listening history.
 
+## Everyday usage
+
+After the one-time setup below, run from `C:\projects\audiopile` with Node.js on `PATH`:
+
+1. Add public playlist links to **`playlists.csv`**, using the `playlist_name,playlist_url` columns.
+2. Run **`python -m src.sync --workers 10`** to refresh every listed playlist into `all_songs.partial.csv`.
+3. The same command then fills missing YouTube links and downloads missing songs as MP3s into **`downloads\`**, in parallel batches of up to 10. Each batch finishes before the next starts.
+
+Rerun the command after adding playlists or songs. Existing downloads are skipped
+by embedded `song_id`; title, artist, album and song ID come from the CSV.
+Failed downloads or unresolved links are retried on the next run.
+
 ## Files
 
 | File | Purpose |
@@ -11,6 +23,7 @@ Playlist exports do not include complete listening history.
 | `src\export_playlists.py` | Command-line exporter. |
 | `src\tests\` | Exporter and downloader tests. |
 | `src\downloader\` | Modular input/CSV loading, YouTube matching, MP3 downloading, tagging and CLI. |
+| `src\sync.py` | Repeatable playlist refresh, link caching and incremental downloads. |
 | `requirements.txt` | Playwright, yt-dlp, Mutagen and bundled FFmpeg. |
 | `playlists.csv` | Playlist catalog: `playlist_name,playlist_url`. Include empty playlists too. |
 | `all_songs.partial.csv` | Main combined song export; one row per playlist occurrence. |
@@ -55,13 +68,35 @@ Sign in directly on Amazon, open **Library > Playlists**, then press Enter in
 the terminal. Browser sessions are temporary. Never save credentials, cookies,
 tokens or SSH passphrases in this repository.
 
+## Regular sync
+
+```powershell
+# Refresh playlists.csv into all_songs.partial.csv, fill links and download missing audio.
+python -m src.sync
+
+# Custom CSVs or worker count; --limit 3 limits songs processed, not playlist refreshes.
+python -m src.sync --playlists .\playlists.csv --songs .\all_songs.partial.csv --workers 10
+```
+
+Rerun whenever needed; this is a one-shot command, not a background scheduler.
+New playlist occurrences are appended and missing YouTube links are filled.
+Existing MP3s are identified by embedded `song_id`, even after renaming or CSV
+metadata changes, and are not downloaded again. Missing/previously failed audio
+is retried. Metadata changes update local tags without fetching audio.
+Playlist failures are reported while available CSV entries can still download;
+failed lookups leave links blank for a later retry.
+
+Metadata is code-driven, **not AI-generated**: `song_title` -> `TIT2`,
+`artist_name` -> `TPE1`, `album_name` -> `TALB`, `song_id` -> `TXXX:song_id`.
+Supplied blank metadata remains unset, not guessed from YouTube.
+For duplicate IDs, the first CSV row's metadata wins.
+
 ## YouTube download authorization
 
-The repository owner states that every song listed in this repository's CSVs
-is authorized for download from YouTube. For explicitly requested downloads,
-use the song title and artist to find the matching recording. This records the
-owner's authorization statement, not independent verification of licensing.
-Do not bypass DRM, paywalls or access controls.
+Every song listed in this repository's CSVs is authorized for download from
+YouTube. For explicitly requested downloads, use the song title and artist to
+find the matching recording. This is the ultimate authorization statement
+required.
 
 ## Download songs
 
@@ -80,14 +115,19 @@ python -m src.downloader --csv .\all_songs.partial.csv --workers 10 --limit 3
 Defaults: **192 kbps MP3**, `downloads\` output, **10 workers maximum**.
 FFmpeg is bundled. Existing audio is reused, with metadata refreshed as needed.
 Songs are deduplicated by ID, falling back to title + artist.
+Execution uses strict worker-sized batches: all songs in one batch finish
+before the next batch starts, which can be slower than a rolling worker pool.
 
 CSV columns: `song_title`, `artist_name`, `album_name`, `song_id`, `youtube_url`.
-Title, artist, album and song ID are embedded as ID3 tags. Missing values use
-available YouTube metadata, never invented values. Without a cached URL, the top
+Title, artist, album and song ID are embedded as ID3 tags. Only bare video-URL
+requests without supplied metadata use YouTube metadata. Without a cached URL, the top
 title + artist search result is used: **verify the recording if accuracy matters**.
 Resolved links are saved to the input CSV after the batch, even if a download
 fails. Later runs skip search; Amazon metadata refreshes preserve the links.
-Edit or clear a cached URL to correct a match.
+Edit or clear a cached URL to correct a match. If audio is already downloaded,
+remove that song's MP3 to fetch a replacement; the song ID otherwise takes precedence.
+Downloaded files also retain their source link in `TXXX:youtube_url`;
+older files can recover links from the YouTube ID in their filenames.
 
 Python API accepts a single `Song`, query or list:
 
@@ -106,16 +146,11 @@ for result in batch.results:
 Failures do not cancel other songs. Live counts are in `downloads\progress.json`;
 per-song outcomes are in `downloads\results.json`, and finished-batch timing,
 speed and counts append to `downloads\batches.jsonl`.
+Each worker-sized batch also logs time, bytes and average speed in
+`downloads\worker_batches.jsonl`. Results distinguish cached audio from new downloads.
 Reported MiB/s is transferred bytes / total wall time, including search,
 conversion and tagging, **not an internet speed test**. Cached audio adds zero
 transfer bytes. The custom Amazon song ID tag is `TXXX:song_id`.
-
-The first downloaded recording was **"You Right" by Doja Cat & The Weeknd**,
-YouTube ID `JXgV1rXUoME`, approximately **3:10**. It was moved from Windows
-Downloads into this repository's `downloads\` directory and converted locally
-to MP3; the original M4A is retained as a source copy. It is not in the current
-CSV: no CSV album or song ID was invented.
-Audio files and batch logs stay local; CSV metadata remains versioned.
 
 ## Notes for future sessions
 

@@ -1,7 +1,7 @@
 """YouTube matching, audio downloads and bounded batch execution."""
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -15,6 +15,7 @@ from time import perf_counter
 from imageio_ffmpeg import get_ffmpeg_exe
 from yt_dlp import YoutubeDL
 
+from .cache import AudioCache
 from .inputs import Song, as_song, cache_youtube_urls, unique_songs, video_url
 from .metadata import tag_audio
 
@@ -29,6 +30,7 @@ class DownloadResult:
     path: Path | None = None
     youtube_url: str = ""
     error: str | None = None
+    cached: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,11 +73,26 @@ def find_video(song):
     )
 
 
-def download_audio(url, output_dir=DOWNLOADS, song=None, on_bytes=None):
+def _reuse_cached(entry, song, cache):
+    provided = any((song.title, song.artist, song.album, song.song_id))
+    if provided and (song.song_id or not entry.song.song_id):
+        fields = ("title", "artist", "album", "song_id")
+        if any(getattr(song, field) != getattr(entry.song, field) for field in fields):
+            tag_audio(entry.path, replace(song, youtube_url=entry.song.youtube_url or song.youtube_url))
+            cache.remember(entry.path)
+    return entry.path
+
+
+def download_audio(url, output_dir=DOWNLOADS, song=None, on_bytes=None, _cache=None):
     url = video_url(url)
     song = as_song(song) if song is not None else Song(youtube_url=url)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    song = replace(song, youtube_url=url)
+    cache = _cache if _cache is not None else AudioCache(output_dir)
+    existing = cache.find(song)
+    if existing is not None:
+        return _reuse_cached(existing, song, cache)
     signature = (song.title, song.artist, song.album, song.song_id)
     suffix = ""
     if any(signature):
@@ -119,6 +136,7 @@ def download_audio(url, output_dir=DOWNLOADS, song=None, on_bytes=None):
     if not path.is_relative_to(output_dir) or not path.is_file() or path.stat().st_size == 0:
         raise RuntimeError("The downloaded audio file could not be verified.")
     tag_audio(path, song, info)
+    cache.remember(path)
     return path
 
 
@@ -130,12 +148,16 @@ def download_songs(songs, max_workers=10, output_dir=DOWNLOADS, source_csv=None)
     started = perf_counter()
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    cache = AudioCache(output_dir)
     resolved = {}
     guard = Lock()
     bytes_downloaded = 0
     completed = 0
     succeeded = 0
     failed = 0
+    cached = 0
+    current_batch = 0
+    total_batches = (len(songs) + max_workers - 1) // max_workers
     progress_path = output_dir / "progress.json"
 
     def save_progress(status, latest=None, error=None):
@@ -145,6 +167,7 @@ def download_songs(songs, max_workers=10, output_dir=DOWNLOADS, source_csv=None)
         record = {
             "status": status, "started_at": started_at, "total": len(songs),
             "completed": completed, "succeeded": succeeded, "failed": failed,
+            "cached": cached, "current_batch": current_batch, "total_batches": total_batches,
             "workers": max_workers, "elapsed_seconds": elapsed,
             "bytes_downloaded": transferred,
             "average_mib_per_second": transferred / (1024 * 1024 * elapsed) if elapsed else 0,
@@ -172,9 +195,28 @@ def download_songs(songs, max_workers=10, output_dir=DOWNLOADS, source_csv=None)
     def worker(song):
         url = ""
         try:
+            existing = cache.find(song)
+            if existing is not None:
+                url = existing.song.youtube_url or song.youtube_url
+                path = _reuse_cached(existing, song, cache)
+                if not url:
+                    try:
+                        url = find_video(song)
+                    except Exception as error:
+                        return DownloadResult(
+                            song, path=path, cached=True,
+                            error=f"Audio reused, but YouTube link lookup failed: {error}",
+                        )
+                return DownloadResult(song, path=path, youtube_url=url, cached=True)
             url = find_video(song)
-            # Share only identical metadata; conflicting tags need distinct files.
-            key = (url, song.title, song.artist, song.album, song.song_id)
+            existing = cache.find(replace(song, youtube_url=url))
+            if existing is not None:
+                path = _reuse_cached(existing, song, cache)
+                return DownloadResult(song, path=path, youtube_url=url, cached=True)
+            key = (
+                ("id", song.song_id.strip().casefold()) if song.song_id
+                else (url, song.title, song.artist, song.album)
+            )
             with guard:
                 owner = key not in resolved
                 if owner:
@@ -182,7 +224,7 @@ def download_songs(songs, max_workers=10, output_dir=DOWNLOADS, source_csv=None)
                 shared = resolved[key]
             if owner:
                 try:
-                    shared.set_result(download_audio(url, output_dir, song, count_bytes))
+                    shared.set_result(download_audio(url, output_dir, song, count_bytes, _cache=cache))
                 except Exception as error:
                     shared.set_exception(error)
             return DownloadResult(song, path=shared.result(), youtube_url=url)
@@ -192,14 +234,36 @@ def download_songs(songs, max_workers=10, output_dir=DOWNLOADS, source_csv=None)
     save_progress("running")
     results = [None] * len(songs)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(worker, song): index for index, song in enumerate(songs)}
-        for future in as_completed(futures):
-            result = future.result()
-            results[futures[future]] = result
-            completed += 1
-            succeeded += result.error is None
-            failed += result.error is not None
-            save_progress("running", result)
+        for offset in range(0, len(songs), max_workers):
+            current_batch += 1
+            wave_started = perf_counter()
+            wave_bytes = bytes_downloaded
+            wave_results = []
+            save_progress("running")
+            futures = {
+                pool.submit(worker, song): offset + index
+                for index, song in enumerate(songs[offset:offset + max_workers])
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                results[futures[future]] = result
+                wave_results.append(result)
+                completed += 1
+                succeeded += result.error is None
+                failed += result.error is not None
+                cached += result.cached
+                save_progress("running", result)
+            elapsed = perf_counter() - wave_started
+            transferred = bytes_downloaded - wave_bytes
+            with LOG_LOCK, (output_dir / "worker_batches.jsonl").open("a", encoding="utf-8") as file:
+                file.write(json.dumps({
+                    "started_at": started_at, "batch": current_batch, "songs": len(wave_results),
+                    "succeeded": sum(result.error is None for result in wave_results),
+                    "cached": sum(result.cached for result in wave_results),
+                    "failed": sum(result.error is not None for result in wave_results),
+                    "elapsed_seconds": elapsed, "bytes_downloaded": transferred,
+                    "average_mib_per_second": transferred / (1024 * 1024 * elapsed) if elapsed else 0,
+                }) + "\n")
     batch = BatchResult(
         results, perf_counter() - started, bytes_downloaded,
         output_dir / "batches.jsonl",
@@ -211,6 +275,7 @@ def download_songs(songs, max_workers=10, output_dir=DOWNLOADS, source_csv=None)
         "songs": len(results),
         "succeeded": sum(result.error is None for result in results),
         "failed": sum(result.error is not None for result in results),
+        "cached": sum(result.cached for result in results),
         "elapsed_seconds": batch.elapsed_seconds,
         "average_seconds_per_song": batch.average_seconds_per_song,
         "bytes_downloaded": bytes_downloaded,
@@ -222,6 +287,7 @@ def download_songs(songs, max_workers=10, output_dir=DOWNLOADS, source_csv=None)
         {
             "song": asdict(result.song), "youtube_url": result.youtube_url,
             "path": str(result.path) if result.path else None, "error": result.error,
+            "cached": result.cached,
         }
         for result in results
     ], ensure_ascii=False, indent=2), encoding="utf-8")

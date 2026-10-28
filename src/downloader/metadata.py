@@ -12,14 +12,20 @@ def tag_audio(path, song, fallback=None):
         tags = ID3(path)
     except ID3NoHeaderError:
         tags = ID3()
+    provided = any((song.title, song.artist, song.album, song.song_id))
     fields = (
-        (TIT2, song.title or fallback.get("track") or fallback.get("title")),
-        (TPE1, song.artist or fallback.get("artist") or fallback.get("uploader")),
-        (TALB, song.album or fallback.get("album")),
+        (TIT2, song.title if provided else fallback.get("track") or fallback.get("title")),
+        (TPE1, song.artist if provided else fallback.get("artist") or fallback.get("uploader")),
+        (TALB, song.album if provided else fallback.get("album")),
     )
     for frame, value in fields:
         if value:
             tags.setall(frame.__name__, [frame(encoding=3, text=[value])])
+        elif provided:
+            tags.delall(frame.__name__)
     if song.song_id:
         tags.setall("TXXX:song_id", [TXXX(encoding=3, desc="song_id", text=[song.song_id])])
+    url = song.youtube_url or fallback.get("webpage_url")
+    if url:
+        tags.setall("TXXX:youtube_url", [TXXX(encoding=3, desc="youtube_url", text=[url])])
     tags.save(path, v2_version=3)
