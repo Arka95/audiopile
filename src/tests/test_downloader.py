@@ -291,6 +291,8 @@ class DownloaderTests(unittest.TestCase):
             path.write_bytes(b"fixture")
             url = "https://www.youtube.com/watch?v=JXgV1rXUoME"
             tag_audio(path, Song(title="Old", artist="Artist", album="Old album", song_id="S", youtube_url=url))
+            before = path.read_bytes()
+            modified = path.stat().st_mtime_ns
             song = Song(title="Updated", artist="Artist", album="New album", song_id="S")
             batch = download_songs([song, song], output_dir=directory)
             self.assertEqual(len(batch.results), 1)
@@ -298,7 +300,9 @@ class DownloaderTests(unittest.TestCase):
             self.assertEqual(batch.results[0].path, path.resolve())
             self.assertEqual(batch.bytes_downloaded, 0)
             self.assertEqual(ID3(path)["TXXX:song_id"].text, ["S"])
-            self.assertEqual(ID3(path)["TALB"].text, ["New album"])
+            self.assertEqual(ID3(path)["TALB"].text, ["Old album"])
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(path.stat().st_mtime_ns, modified)
             find.assert_not_called()
             download.assert_not_called()
 
@@ -313,8 +317,11 @@ class DownloaderTests(unittest.TestCase):
                         youtube_url="https://www.youtube.com/watch?v=JXgV1rXUoME")
             tag_audio(path, song)
             before = path.read_bytes()
-            self.assertEqual(download_audio(song.youtube_url, directory, song), path.resolve())
+            changed = Song(title="Changed", artist="Other", album="Different", song_id="S")
+            modified = path.stat().st_mtime_ns
+            self.assertEqual(download_audio(song.youtube_url, directory, changed), path.resolve())
             self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(path.stat().st_mtime_ns, modified)
             factory.assert_not_called()
             self.assertIsNone(AudioCache(directory).find(
                 Song(title="Title", artist="Artist", song_id="Different")
@@ -368,8 +375,71 @@ class DownloaderTests(unittest.TestCase):
             self.assertTrue(result.cached)
             self.assertEqual(result.path, path.resolve())
             self.assertIn("YouTube link lookup failed", result.error)
-            self.assertEqual(ID3(path)["TIT2"].text, ["Current title"])
+            self.assertEqual(ID3(path)["TIT2"].text, ["Old title"])
             download.assert_not_called()
+
+    @patch("src.downloader.core.YoutubeDL")
+    def test_tracker_is_authoritative_without_scanning_or_checking_audio(self, factory):
+        from src.downloader.cache import AudioCache
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "existing.mp3"
+            path.write_bytes(b"fixture")
+            song = Song(title="Title", song_id="S",
+                        youtube_url="https://www.youtube.com/watch?v=JXgV1rXUoME")
+            tag_audio(path, song)
+            AudioCache(directory)
+            tracker = Path(directory) / "downloaded.json"
+            records = json.loads(tracker.read_text(encoding="utf-8"))
+            self.assertEqual(records[0]["song"]["song_id"], "S")
+            path.unlink()
+            with patch("src.downloader.cache.ID3", side_effect=AssertionError("Tags read")), \
+                 patch.object(Path, "rglob", side_effect=AssertionError("Directory scanned")), \
+                 patch.object(Path, "is_file", side_effect=AssertionError("Audio checked")):
+                self.assertEqual(download_audio(song.youtube_url, directory, song), path.resolve())
+            factory.assert_not_called()
+            tracker.write_text("[]", encoding="utf-8")
+            self.assertIsNone(AudioCache(directory).find(song))
+
+    def test_successful_audio_registration_persists_but_invalid_files_do_not(self):
+        from src.downloader.cache import AudioCache
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = AudioCache(directory)
+            path = Path(directory) / "new.mp3"
+            path.write_bytes(b"fixture")
+            cache.remember(path)
+            tracker = Path(directory) / "downloaded.json"
+            self.assertEqual(json.loads(tracker.read_text()), [])
+            song = Song(title="Title", song_id="NEW")
+            tag_audio(path, song)
+            cache.remember(path)
+            self.assertEqual(AudioCache(directory).find(song).path, path.resolve())
+
+    @patch("src.downloader.core.sleep")
+    @patch("src.downloader.core.download_audio")
+    @patch("src.downloader.core.find_video", return_value="https://www.youtube.com/watch?v=JXgV1rXUoME")
+    def test_progress_update_retries_transient_windows_permission_errors(self, find, download, sleep):
+        import os
+
+        original_replace = os.replace
+        denied = 0
+
+        def replace(source, target):
+            nonlocal denied
+            if Path(target).name == "progress.json" and denied < 2:
+                denied += 1
+                raise PermissionError("Temporary Windows file lock")
+            return original_replace(source, target)
+
+        with tempfile.TemporaryDirectory() as directory:
+            download.return_value = Path(directory) / "new.mp3"
+            with patch("src.downloader.core.os.replace", side_effect=replace):
+                batch = download_songs("Title", output_dir=directory)
+            self.assertIsNone(batch.results[0].error)
+            self.assertEqual(denied, 2)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(json.loads((Path(directory) / "progress.json").read_text())["status"], "completed")
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from pathlib import Path
 import shutil
 import tempfile
 from threading import Lock
-from time import perf_counter
+from time import perf_counter, sleep
 
 from imageio_ffmpeg import get_ffmpeg_exe
 from yt_dlp import YoutubeDL
@@ -73,16 +73,6 @@ def find_video(song):
     )
 
 
-def _reuse_cached(entry, song, cache):
-    provided = any((song.title, song.artist, song.album, song.song_id))
-    if provided and (song.song_id or not entry.song.song_id):
-        fields = ("title", "artist", "album", "song_id")
-        if any(getattr(song, field) != getattr(entry.song, field) for field in fields):
-            tag_audio(entry.path, replace(song, youtube_url=entry.song.youtube_url or song.youtube_url))
-            cache.remember(entry.path)
-    return entry.path
-
-
 def download_audio(url, output_dir=DOWNLOADS, song=None, on_bytes=None, _cache=None):
     url = video_url(url)
     song = as_song(song) if song is not None else Song(youtube_url=url)
@@ -92,7 +82,7 @@ def download_audio(url, output_dir=DOWNLOADS, song=None, on_bytes=None, _cache=N
     cache = _cache if _cache is not None else AudioCache(output_dir)
     existing = cache.find(song)
     if existing is not None:
-        return _reuse_cached(existing, song, cache)
+        return existing.path
     signature = (song.title, song.artist, song.album, song.song_id)
     suffix = ""
     if any(signature):
@@ -182,7 +172,14 @@ def download_songs(songs, max_workers=10, output_dir=DOWNLOADS, source_csv=None)
             ) as file:
                 temporary = Path(file.name)
                 json.dump(record, file)
-            os.replace(temporary, progress_path)
+            for attempt in range(6):
+                try:
+                    os.replace(temporary, progress_path)
+                    break
+                except PermissionError:
+                    if attempt == 5:
+                        raise
+                    sleep(0.05 * (attempt + 1))
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
@@ -198,7 +195,7 @@ def download_songs(songs, max_workers=10, output_dir=DOWNLOADS, source_csv=None)
             existing = cache.find(song)
             if existing is not None:
                 url = existing.song.youtube_url or song.youtube_url
-                path = _reuse_cached(existing, song, cache)
+                path = existing.path
                 if not url:
                     try:
                         url = find_video(song)
@@ -211,7 +208,7 @@ def download_songs(songs, max_workers=10, output_dir=DOWNLOADS, source_csv=None)
             url = find_video(song)
             existing = cache.find(replace(song, youtube_url=url))
             if existing is not None:
-                path = _reuse_cached(existing, song, cache)
+                path = existing.path
                 return DownloadResult(song, path=path, youtube_url=url, cached=True)
             key = (
                 ("id", song.song_id.strip().casefold()) if song.song_id
