@@ -20,7 +20,7 @@ class SyncResult:
 
 
 def sync_playlists(
-    catalog_path=ROOT / "playlists.csv",
+    catalog_path=ROOT / "amazonmusic.playlists.csv",
     songs_path=ROOT / "all_songs.partial.csv",
     max_workers=10,
     output_dir=DOWNLOADS,
@@ -57,7 +57,7 @@ def main(argv=None):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--playlists", type=Path, default=ROOT / "playlists.csv")
+    parser.add_argument("--playlists", type=Path, default=ROOT / "amazonmusic.playlists.csv")
     parser.add_argument("--songs", type=Path, default=ROOT / "all_songs.partial.csv")
     parser.add_argument("--workers", type=int, choices=range(1, 11), default=10)
     parser.add_argument("--limit", type=int, help="Process only the first N unique songs after refreshing")

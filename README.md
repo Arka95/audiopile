@@ -8,7 +8,7 @@ Playlist exports do not include complete listening history.
 
 After the one-time setup below, run from `C:\projects\audiopile` with Node.js on `PATH`:
 
-1. Add public playlist links to **`playlists.csv`**, using the `playlist_name,playlist_url` columns.
+1. Add public playlist links to **`amazonmusic.playlists.csv`**, using the `playlist_name,playlist_url` columns.
 2. Run **`python -m src.sync --workers 10`** to refresh every listed playlist into `all_songs.partial.csv`.
 3. The same command then fills missing YouTube links and downloads missing songs as MP3s into **`downloads\`**, in parallel batches of up to 10. Each batch finishes before the next starts.
 
@@ -25,7 +25,7 @@ Failed downloads or unresolved links are retried on the next run.
 | `src\downloader\` | Modular input/CSV loading, YouTube matching, MP3 downloading, tagging and CLI. |
 | `src\sync.py` | Repeatable playlist refresh, link caching and incremental downloads. |
 | `requirements.txt` | Playwright, yt-dlp, Mutagen and bundled FFmpeg. |
-| `playlists.csv` | Playlist catalog: `playlist_name,playlist_url`. Include empty playlists too. |
+| `amazonmusic.playlists.csv` | Playlist catalog: `playlist_name,playlist_url`. Include empty playlists too. |
 | `all_songs.partial.csv` | Main combined song export; one row per playlist occurrence. |
 | `amazon_music_public_playlists.partial.csv` | Older snapshot of the first two playlists; not the main dataset. |
 | `downloads\` | Local audio files; everything here is Git-ignored. |
@@ -41,7 +41,7 @@ python -m pip install -r .\requirements.txt
 python -m playwright install chromium
 
 # Re-export every playlist in the catalog.
-$links = @(Import-Csv .\playlists.csv | ForEach-Object { $_.playlist_url })
+$links = @(Import-Csv .\amazonmusic.playlists.csv | ForEach-Object { $_.playlist_url })
 python .\src\export_playlists.py @links --headless --output .\all_songs.csv
 
 # Run tests.
@@ -71,11 +71,11 @@ tokens or SSH passphrases in this repository.
 ## Regular sync
 
 ```powershell
-# Refresh playlists.csv into all_songs.partial.csv, fill links and download missing audio.
+# Refresh amazonmusic.playlists.csv into all_songs.partial.csv, fill links and download missing audio.
 python -m src.sync
 
 # Custom CSVs or worker count; --limit 3 limits songs processed, not playlist refreshes.
-python -m src.sync --playlists .\playlists.csv --songs .\all_songs.partial.csv --workers 10
+python -m src.sync --playlists .\amazonmusic.playlists.csv --songs .\all_songs.partial.csv --workers 10
 ```
 
 Rerun whenever needed; this is a one-shot command, not a background scheduler.
@@ -156,7 +156,7 @@ transfer bytes. The custom Amazon song ID tag is `TXXX:song_id`.
 
 - Prefer direct playlist links. The supplied profile pages showed no public
   content even though direct public playlist links worked.
-- Add new playlist names and canonical links to `playlists.csv`, then refresh
+- Add new playlist names and canonical links to `amazonmusic.playlists.csv`, then refresh
   the full catalog. The exporter replaces its output; it does not append or
   automatically update the catalog.
 - Required song columns: `song_id`, `song_title`, `artist_name`, `album_name`,

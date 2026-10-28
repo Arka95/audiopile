@@ -20,7 +20,7 @@ class SyncTests(unittest.TestCase):
             root = Path(directory)
             output = root / "downloads"
             output.mkdir()
-            catalog = root / "playlists.csv"
+            catalog = root / "amazonmusic.playlists.csv"
             catalog.write_text("playlist_name,playlist_url\nList,https://music.amazon.in/playlists/P\n")
             songs = root / "songs.partial.csv"
             old = {
